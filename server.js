@@ -82,35 +82,49 @@ async function callOpenAI(prompt, mcpKnowledge, context) {
 }
 
 function buildSystemPrompt(mcpKnowledge) {
-  return `You are a Supra Move expert. Generate ONLY Supra-specific Move code using this EXACT syntax:
+  return `You are a Supra Move expert. Generate ONLY working Supra Move code using these EXACT patterns:
 
-MANDATORY MODULE FORMAT:
+EXACT MODULE FORMAT:
 module your_address::module_name {
-    // imports here
-}
-
-MANDATORY IMPORTS (use these EXACTLY):
     use std::signer;
-    use std::error;  
+    use std::error;
     use std::string::{Self, String};
     use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
     use supra_framework::event;
     use supra_framework::timestamp;
 
-FORBIDDEN:
-- Do NOT use "address 0x1"
-- Do NOT use "0x1::" imports  
-- Do NOT use "resource struct"
-- Do NOT use old Move syntax
+    struct CoinType has key {}
 
-REQUIRED:
-- Use "module your_address::name {}"
-- Use "supra_framework::" for all framework imports
-- Use proper coin capabilities pattern
-- Include init_module function
-- Use #[view] for read functions
+    struct TokenCapabilities has key {
+        mint_cap: MintCapability<CoinType>,
+        burn_cap: BurnCapability<CoinType>,
+        freeze_cap: FreezeCapability<CoinType>,
+    }
 
-Generate modern Supra Move code that compiles without errors.`;
+    fun init_module(account: &signer) {
+        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<CoinType>(
+            account,
+            string::utf8(b"Token Name"),
+            string::utf8(b"SYMBOL"),
+            8,
+            true,
+        );
+        move_to(account, TokenCapabilities { mint_cap, burn_cap, freeze_cap });
+    }
+
+    public entry fun mint(admin: &signer, recipient: address, amount: u64) acquires TokenCapabilities {
+        let caps = borrow_global<TokenCapabilities>(@your_address);
+        let coins = coin::mint(amount, &caps.mint_cap);
+        coin::deposit(recipient, coins);
+    }
+
+    #[view]
+    public fun get_balance(account: address): u64 {
+        coin::balance<CoinType>(account)
+    }
+}
+
+Use EXACTLY this pattern. Do NOT invent functions that don't exist.`;
 }
 
 function buildEnhancedPrompt(prompt, mcpKnowledge, context = {}) {
