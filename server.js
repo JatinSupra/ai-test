@@ -1,47 +1,134 @@
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { createHash } = require('crypto');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Fix for Render proxy issues
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.set('trust proxy', 1);
-app.use(cors());
 
-// Rate limiting - 20 requests per hour per IP
+// Rate limiting
 const generateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 20,
   message: {
-    error: 'Rate limit exceeded. Please try again later or contact support for higher limits.',
+    error: 'Rate limit exceeded. Please try again later.',
     type: 'rate_limit'
   },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// User usage tracking (in production, use a database)
+// User usage tracking
 const userUsage = new Map();
-const FREE_TIER_LIMIT = 10;
+const FREE_TIER_LIMIT = 50;
 
-// Reset user usage monthly
+// Reset usage daily instead of monthly to avoid timeout issues
 setInterval(() => {
   userUsage.clear();
-}, 30 * 24 * 60 * 60 * 1000); // 30 days
+}, 24 * 60 * 60 * 1000);
 
-async function callOpenAI(prompt, mcpKnowledge, context) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OpenAI API key not configured on server');
+// Optimized system prompt for Supra Move
+function buildOptimizedSystemPrompt() {
+  return `You are a Supra Move compiler expert. Generate ONLY code that compiles without errors.
+
+CRITICAL RULES (NEVER BREAK THESE):
+1. Functions using borrow_global MUST have "acquires ResourceName"
+2. Only import what you actually use - remove unused imports
+3. Prefix unused parameters with underscore: _param
+4. Use signer::address_of(account) NOT @0x1 for addresses
+5. Use std::string::utf8() for string literals
+
+EXACT WORKING TEMPLATE:
+module your_address::module_name {
+    use std::signer;
+    use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
+
+    struct CoinType has key {}
+    
+    struct TokenCapabilities has key {
+        mint_cap: MintCapability<CoinType>,
+        burn_cap: BurnCapability<CoinType>,
+        freeze_cap: FreezeCapability<CoinType>,
+    }
+
+    fun init_module(account: &signer) acquires TokenCapabilities {
+        let addr = signer::address_of(account);
+        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<CoinType>(
+            account,
+            std::string::utf8(b"Token Name"),
+            std::string::utf8(b"SYMBOL"),
+            8,
+            true,
+        );
+        move_to(account, TokenCapabilities { mint_cap, burn_cap, freeze_cap });
+        
+        // If initial mint requested:
+        let caps = borrow_global<TokenCapabilities>(addr);
+        let coins = coin::mint(amount_with_decimals, &caps.mint_cap);
+        coin::deposit(addr, coins);
+    }
+
+    public entry fun mint(_admin: &signer, recipient: address, amount: u64) acquires TokenCapabilities {
+        let caps = borrow_global<TokenCapabilities>(@your_address);
+        let coins = coin::mint(amount, &caps.mint_cap);
+        coin::deposit(recipient, coins);
+    }
+
+    #[view]
+    public fun get_balance(account: address): u64 {
+        coin::balance<CoinType>(account)
+    }
+}
+
+NEVER generate code with compilation errors. Always use this exact pattern.`;
+}
+
+// Enhanced prompt builder
+function buildEnhancedPrompt(prompt, context = {}) {
+  const moduleName = context?.moduleName || 'custom_contract';
+  let instructions = '';
+  
+  // Smart detection of requirements
+  if (prompt.toLowerCase().includes('mint') && (prompt.includes('1000000') || prompt.includes('1 M'))) {
+    instructions += '\n- Mint exactly 1,000,000 tokens (use: 100000000000000 for 8 decimals)';
+  }
+  
+  if (prompt.toLowerCase().includes('deployer')) {
+    instructions += '\n- Mint initial tokens to deployer address using signer::address_of(account)';
+  }
+  
+  if (prompt.toLowerCase().includes('balance')) {
+    instructions += '\n- Include get_balance view function';
   }
 
-  const systemPrompt = buildSystemPrompt(mcpKnowledge);
-  const enhancedPrompt = buildEnhancedPrompt(prompt, mcpKnowledge, context);
+  return `Create a Supra Move smart contract: ${prompt}
+
+Module name: ${moduleName}
+${instructions}
+
+Requirements:
+- Use the exact template pattern provided
+- Ensure ALL functions with borrow_global have acquires annotation
+- Remove unused imports
+- Make it compile without errors or warnings`;
+}
+
+// Optimized OpenAI call
+async function callOpenAI(prompt, context) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('OpenAI API key not configured');
+  }
+
+  const systemPrompt = buildOptimizedSystemPrompt();
+  const enhancedPrompt = buildEnhancedPrompt(prompt, context);
 
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -53,17 +140,11 @@ async function callOpenAI(prompt, mcpKnowledge, context) {
       body: JSON.stringify({
         model: 'gpt-4',
         messages: [
-          {
-            role: 'system',
-            content: systemPrompt
-          },
-          {
-            role: 'user',
-            content: enhancedPrompt
-          }
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: enhancedPrompt }
         ],
-        max_tokens: 3000,
-        temperature: 0.7
+        max_tokens: 2000,
+        temperature: 0.3 // Lower temperature for more consistent code
       })
     });
 
@@ -76,97 +157,30 @@ async function callOpenAI(prompt, mcpKnowledge, context) {
     return data.choices[0].message.content;
 
   } catch (error) {
-    console.error('OpenAI API call failed:', error);
+    console.error('OpenAI call failed:', error);
     throw error;
   }
 }
 
-function buildSystemPrompt(mcpKnowledge) {
-  return `You are a Supra Move expert. Generate ONLY working Supra Move code using these EXACT patterns:
-
-EXACT MODULE FORMAT:
-module your_address::module_name {
-    use std::signer;
-    use std::error;
-    use std::string::{Self, String};
-    use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
-    use supra_framework::event;
-    use supra_framework::timestamp;
-
-    struct CoinType has key {}
-
-    struct TokenCapabilities has key {
-        mint_cap: MintCapability<CoinType>,
-        burn_cap: BurnCapability<CoinType>,
-        freeze_cap: FreezeCapability<CoinType>,
-    }
-
-    fun init_module(account: &signer) {
-        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<CoinType>(
-            account,
-            string::utf8(b"Token Name"),
-            string::utf8(b"SYMBOL"),
-            8,
-            true,
-        );
-        move_to(account, TokenCapabilities { mint_cap, burn_cap, freeze_cap });
-    }
-
-    public entry fun mint(admin: &signer, recipient: address, amount: u64) acquires TokenCapabilities {
-        let caps = borrow_global<TokenCapabilities>(@your_address);
-        let coins = coin::mint(amount, &caps.mint_cap);
-        coin::deposit(recipient, coins);
-    }
-
-    #[view]
-    public fun get_balance(account: address): u64 {
-        coin::balance<CoinType>(account)
-    }
-}
-
-Use EXACTLY this pattern. Do NOT invent functions that don't exist.`;
-}
-
-function buildEnhancedPrompt(prompt, mcpKnowledge, context = {}) {
-  const moduleName = (context && context.moduleName) || 'custom_contract';
-  const features = (context && Array.isArray(context.features)) ? context.features.join(', ') : 'basic functionality';
+// Code validation
+function validateCode(code) {
+  const issues = [];
   
-  return `Generate a Supra Move smart contract: ${prompt}
-
-REQUIREMENTS:
-- Module name: ${moduleName}
-- Features needed: ${features}
-- Use only verified modules from the knowledge base
-- Include proper init_module function
-- Add comprehensive error handling
-- Emit events for important operations
-- Include view functions for reading state
-- Follow Supra-specific patterns exactly
-
-VALIDATION CHECKLIST:
-✓ Use supra_framework:: imports only
-✓ No duplicate imports
-✓ Proper coin registration checks
-✓ Correct burn/mint patterns
-✓ Handle Option types for supply
-✓ Include proper error codes
-✓ Add event emissions
-
-Make it production-ready with proper validation, events, and error handling.`;
-}
-
-function checkUserUsage(userId) {
-  const usage = userUsage.get(userId) || { count: 0, lastReset: new Date() };
-  
-  // Reset if it's been more than 30 days
-  const now = new Date();
-  const daysSinceReset = (now - usage.lastReset) / (1000 * 60 * 60 * 24);
-  
-  if (daysSinceReset >= 30) {
-    usage.count = 0;
-    usage.lastReset = now;
+  // Critical compilation checks
+  if (code.includes('borrow_global') && !code.includes('acquires')) {
+    issues.push('Missing acquires annotation');
   }
   
+  if (code.includes('@0x1') && code.includes('signer::address_of')) {
+    issues.push('Mixed address usage - use signer::address_of consistently');
+  }
+  
+  return issues;
+}
+
+// Usage management
+function checkUserUsage(userId) {
+  const usage = userUsage.get(userId) || { count: 0, lastReset: new Date() };
   return usage;
 }
 
@@ -175,12 +189,12 @@ function updateUserUsage(userId, usage) {
   userUsage.set(userId, usage);
 }
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
-    service: 'supra-ai-service',
-    version: '1.0.0',
+    service: 'supra-ai-optimized',
+    version: '2.0.0',
     timestamp: new Date().toISOString()
   });
 });
@@ -188,9 +202,9 @@ app.get('/health', (req, res) => {
 // Main generation endpoint
 app.post('/v1/generate', generateLimiter, async (req, res) => {
   try {
-    const { prompt, mcpKnowledge, context, userId, extensionVersion } = req.body;
+    const { prompt, context = {}, userId } = req.body;
 
-    // Validate required fields
+    // Validation
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({
         error: 'Missing or invalid prompt',
@@ -198,18 +212,18 @@ app.post('/v1/generate', generateLimiter, async (req, res) => {
       });
     }
 
-    if (!userId || typeof userId !== 'string') {
+    if (!userId) {
       return res.status(400).json({
         error: 'Missing user ID',
         type: 'validation_error'
       });
     }
 
-    // Check user usage limits
+    // Check usage limits
     const usage = checkUserUsage(userId);
     if (usage.count >= FREE_TIER_LIMIT) {
       return res.status(402).json({
-        error: 'Free tier limit reached. Please upgrade your plan or contact support.',
+        error: 'Free tier limit reached. Please upgrade.',
         type: 'usage_limit',
         currentUsage: usage.count,
         limit: FREE_TIER_LIMIT
@@ -218,14 +232,20 @@ app.post('/v1/generate', generateLimiter, async (req, res) => {
 
     console.log(`Generating code for user ${userId}, usage: ${usage.count}/${FREE_TIER_LIMIT}`);
 
-    // Generate code using OpenAI
-    const generatedCode = await callOpenAI(prompt, mcpKnowledge, context);
+    // Generate code
+    const generatedCode = await callOpenAI(prompt, context);
+    
+    // Validate generated code
+    const issues = validateCode(generatedCode);
+    if (issues.length > 0) {
+      console.log('Validation issues:', issues);
+      // Continue anyway but log for improvement
+    }
 
     // Update usage
     updateUserUsage(userId, usage);
 
-    // Log successful generation
-    console.log(`Code generated successfully for user ${userId}, new usage: ${usage.count + 1}/${FREE_TIER_LIMIT}`);
+    console.log(`Code generated successfully for user ${userId}`);
 
     res.json({
       generatedCode,
@@ -234,9 +254,12 @@ app.post('/v1/generate', generateLimiter, async (req, res) => {
         limit: FREE_TIER_LIMIT,
         remaining: FREE_TIER_LIMIT - (usage.count + 1)
       },
+      validation: {
+        issues: issues.length > 0 ? issues : null,
+        status: issues.length === 0 ? 'clean' : 'warnings'
+      },
       metadata: {
         timestamp: new Date().toISOString(),
-        extensionVersion,
         promptLength: prompt.length
       }
     });
@@ -244,27 +267,21 @@ app.post('/v1/generate', generateLimiter, async (req, res) => {
   } catch (error) {
     console.error('Generation error:', error);
 
-    // Handle different types of errors
     if (error.message.includes('OpenAI API')) {
       res.status(503).json({
-        error: 'AI service temporarily unavailable. Please try again.',
+        error: 'AI service temporarily unavailable.',
         type: 'service_error'
-      });
-    } else if (error.message.includes('rate limit')) {
-      res.status(429).json({
-        error: 'Rate limit exceeded on AI service. Please try again later.',
-        type: 'rate_limit'
       });
     } else {
       res.status(500).json({
-        error: 'Internal server error. Please contact support if this persists.',
+        error: 'Generation failed. Please try again.',
         type: 'internal_error'
       });
     }
   }
 });
 
-// Usage stats endpoint
+// Usage stats
 app.get('/v1/usage/:userId', (req, res) => {
   const { userId } = req.params;
   const usage = checkUserUsage(userId);
@@ -273,37 +290,31 @@ app.get('/v1/usage/:userId', (req, res) => {
     current: usage.count,
     limit: FREE_TIER_LIMIT,
     remaining: Math.max(0, FREE_TIER_LIMIT - usage.count),
-    resetDate: new Date(usage.lastReset.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString()
+    resetInfo: 'Usage resets daily'
   });
 });
 
-// Pricing info endpoint
+// Pricing endpoint
 app.get('/v1/pricing', (req, res) => {
   res.json({
     plans: [
       {
         name: 'Free',
         price: 0,
-        generationsPerMonth: FREE_TIER_LIMIT,
-        features: ['Basic AI generation', 'Community support']
+        generationsPerDay: FREE_TIER_LIMIT,
+        features: ['Basic AI generation', 'Compilation validation']
       },
       {
         name: 'Pro',
         price: 29,
-        generationsPerMonth: 500,
-        features: ['Advanced AI generation', 'Priority support', 'Custom templates']
-      },
-      {
-        name: 'Enterprise',
-        price: 199,
-        generationsPerMonth: 'unlimited',
-        features: ['Unlimited generations', 'Dedicated support', 'Custom integrations', 'SLA guarantee']
+        generationsPerDay: 100,
+        features: ['Advanced generation', 'Priority support', 'Custom templates']
       }
     ]
   });
 });
 
-// Error handling middleware
+// Error handling
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({
@@ -321,7 +332,6 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Supra AI Service running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Optimized Supra AI Service running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
