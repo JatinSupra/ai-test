@@ -82,41 +82,35 @@ async function callOpenAI(prompt, mcpKnowledge, context) {
 }
 
 function buildSystemPrompt(mcpKnowledge) {
-  const verifiedModules = mcpKnowledge?.verifiedModules || {};
-  const supraModules = verifiedModules.supraFramework || [];
-  const stdModules = verifiedModules.stdlib || [];
-  
-  return `You are an expert Supra Move blockchain developer with access to comprehensive validation data. Generate complete, functional Move smart contracts using ONLY verified Supra framework modules.
+  return `You are a Supra Move expert. Generate ONLY Supra-specific Move code using this EXACT syntax:
 
-VERIFIED SUPRA FRAMEWORK MODULES (use these):
-${supraModules.join('\n')}
+MANDATORY MODULE FORMAT:
+module your_address::module_name {
+    // imports here
+}
 
-VERIFIED STANDARD LIBRARY MODULES:
-${stdModules.join('\n')}
+MANDATORY IMPORTS (use these EXACTLY):
+    use std::signer;
+    use std::error;  
+    use std::string::{Self, String};
+    use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
+    use supra_framework::event;
+    use supra_framework::timestamp;
 
-CRITICAL VALIDATION RULES:
-1. ALWAYS use "supra_framework::" NOT "aptos_framework::"
-2. NEVER duplicate imports - use single import with multiple items
-3. ALWAYS include proper error handling with these patterns:
-   - Avoid duplicate coin imports
-   - Include required vector and option imports
-   - Use correct coin::burn and supply patterns
-   - Always check coin::is_account_registered before operations
+FORBIDDEN:
+- Do NOT use "address 0x1"
+- Do NOT use "0x1::" imports  
+- Do NOT use "resource struct"
+- Do NOT use old Move syntax
 
-4. Use proper Move patterns:
-   - Include init_module function
-   - Handle coin registration with coin::register<CoinType>()
-   - Use #[view] for read-only functions
-   - Emit events for important operations
-   - Include comprehensive error codes
+REQUIRED:
+- Use "module your_address::name {}"
+- Use "supra_framework::" for all framework imports
+- Use proper coin capabilities pattern
+- Include init_module function
+- Use #[view] for read functions
 
-5. Security best practices:
-   - Validate all inputs
-   - Check permissions properly
-   - Handle edge cases
-   - Use safe arithmetic operations
-
-Generate production-ready code with proper error handling, events, and security measures.`;
+Generate modern Supra Move code that compiles without errors.`;
 }
 
 function buildEnhancedPrompt(prompt, mcpKnowledge, context = {}) {
